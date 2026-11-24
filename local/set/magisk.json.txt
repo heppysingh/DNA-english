@@ -1,0 +1,10 @@
+{
+    "CLASS" : "alpha",              # Magisk channel <stable/alpha/canary>
+    "KEEPVERITY" : "false",          # Usually leave unchanged
+    "KEEPFORCEENCRYPT" : "false",    # Usually leave unchanged
+    "PATCHVBMETAFLAG" : "false",     # Usually leave unchanged
+    "TARGET" : "arm",              # System architecture <arm/x86>
+    "IS_64BIT" : "true"            # true for 64-bit, false for 32-bit
+}
+
+# This file is a configuration guide only; do not use it directly as a config file!
