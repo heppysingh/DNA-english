@@ -97,13 +97,13 @@ else:
 
 
 def call(exe, kz='Y', out=0, shstate=False, sp=0):
-    cmd = f'{BIN_PATH}{exe}' if kz == "Y" else exe
-    if os.name != 'posix':
-        conf = subprocess.CREATE_NO_WINDOW
+    if isinstance(exe, list):
+        cmd = [f'{BIN_PATH}{exe[0]}', *exe[1:]] if kz == "Y" else list(exe)
     else:
-        if sp == 0:
+        cmd = f'{BIN_PATH}{exe}' if kz == "Y" else exe
+        if os.name == 'posix' and sp == 0:
             cmd = cmd.split()
-        conf = 0
+    conf = subprocess.CREATE_NO_WINDOW if os.name != 'posix' else 0
     try:
         ret = subprocess.Popen(cmd, shell=shstate, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, creationflags=conf)
@@ -238,11 +238,13 @@ def set_default_env_setup():
 
 
 def validate_default_env_setup(setup_manifest):
-    for k in ('IS_VAB', 'IS_DYNAMIC', 'REPACK_EROFS_IMG', 'REPACK_SPARSE_IMG', 'REPACK_TO_RW',
+    for k in ('IS_DYNAMIC', 'REPACK_EROFS_IMG', 'REPACK_SPARSE_IMG', 'REPACK_TO_RW',
               'SUPER_SPARSE', 'RESIZE_IMG'):
         if setup_manifest[k] not in ('1', '0'):
             sys.exit(f"Invalid [{k}] - must be one of <1/0>")
 
+    if setup_manifest["IS_VAB"] not in ('0', '1', '2'):
+        sys.exit("Invalid [IS_VAB] - must be one of <0:A-only / 1:Virtual A/B / 2:Dynamic A/B>")
     if setup_manifest["RESIZE_EROFSIMG"] not in ('1', '2', '0'):
         sys.exit("Invalid [RESIZE_EROFSIMG] - must be one of <1/2/0>")
     if not re.match("\\d{1,2}", setup_manifest["ANDROID_SDK"]) or int(setup_manifest["ANDROID_SDK"]) < 5:
@@ -259,7 +261,7 @@ def env_setup():
         'Android Version [12]': "ANDROID_SDK",
         'Device Codename [alioth]': "DEVICE_CODE",
         'Dynamic Partitions [1/0]': "IS_DYNAMIC",
-        'Virtual A/B (VAB) [1/0]': "IS_VAB",
+        'Partition Slot Mode [0:A-only/1:VAB/2:A/B]': "IS_VAB",
         'Repack Image Filesystem [0:EXT4/1:EROFS]': "REPACK_EROFS_IMG",
         'Repack Image Format [0:RAW/1:SPARSE]': "REPACK_SPARSE_IMG",
         'Repack SUPER Image Format [1:SPARSE/0:RAW]': "SUPER_SPARSE",
@@ -530,74 +532,215 @@ def patch_addons():
             print("Error copying files:", e)
 
 
-def repack_super():
-    parts_1 = [
-        'system*',
-        'product',
-        'vendor*',
-        'odm',
-        "my_*"
-    ]
-    parts = []
-    for i in parts_1:
-        for file in glob(V.out + i + '.img'):
-            parts.append(os.path.basename(file).rsplit('.', 1)[0])
-    argvs = f'lpmake --metadata-size 65536 --super-name super --device super:{V.SETUP_MANIFEST["SUPER_SIZE"]}:{int(V.SETUP_MANIFEST["SUPER_SECTOR"]) * 512} '
-    if V.SETUP_MANIFEST['IS_VAB'] == '1':
-        argvs += '--metadata-slots 3 --virtual-ab -F '
-        for i in parts:
-            if os.path.isfile(V.out + i + '.img'):
-                img_a = V.out + i + '.img'
-                file_type = gettype.gettype(img_a)
-                print(img_a)
-                if file_type == 'sparse':
-                    new_img_a = imgextractor.ULTRAMAN().APPLE(img_a)
-                    if os.path.isfile(new_img_a):
-                        os.remove(img_a)
-                        img_a = new_img_a
-                argvs += f'--partition {i}_a:readonly:{imgextractor.ULTRAMAN().LEMON(img_a)}:{V.SETUP_MANIFEST["GROUP_NAME"]}_a --image {i}_a={img_a} --partition {i}_b:readonly:0:{V.SETUP_MANIFEST["GROUP_NAME"]}_b '
-    else:
-        argvs += '--metadata-slots 2 '
-        for i in parts:
-            if os.path.isfile(V.out + i + '_b.img'):
-                img_b = V.out + i + '_b.img'
-                img_a = V.out + i + '.img'
-                if os.path.isfile(V.out + i + '_a.img'):
-                    img_a = V.out + i + '_a.img'
-                file_type_a = gettype.gettype(img_a)
-                file_type_b = gettype.gettype(img_b)
-                if file_type_a == 'sparse':
-                    new_img_a = imgextractor.ULTRAMAN().APPLE(img_a)
-                    if os.path.isfile(new_img_a):
-                        os.remove(img_a)
-                        img_a = new_img_a
-                if file_type_b == 'sparse':
-                    new_img_b = imgextractor.ULTRAMAN().APPLE(img_b)
-                    if os.path.isfile(new_img_b):
-                        os.remove(img_b)
-                        img_b = new_img_b
-                image_size_a = imgextractor.ULTRAMAN().LEMON(img_a)
-                image_size_b = imgextractor.ULTRAMAN().LEMON(img_b)
-                argvs += f'--partition {i}_a:readonly:{image_size_a}:{V.SETUP_MANIFEST["GROUP_NAME"]}_a --image {i}_a={img_a} --partition {i}_b:readonly:{image_size_b}:{V.SETUP_MANIFEST["GROUP_NAME"]}_b --image {i}_b={img_b} '
-    if not parts or "--image" not in argvs:
+def _ensure_raw_img(img_path):
+    if gettype.gettype(img_path) == 'sparse':
+        new_img = imgextractor.ULTRAMAN().APPLE(img_path)
+        if new_img and os.path.isfile(new_img):
+            os.remove(img_path)
+            os.rename(new_img, img_path)
+    return img_path
+
+
+def _is_super_member_img(img_path):
+    base = os.path.basename(img_path).lower()
+    if base.endswith('.unsparse.img'):
+        return False
+    skip_prefixes = ('super', 'boot', 'vendor_boot', 'init_boot', 'recovery', 'dtbo', 'vbmeta')
+    if base in ('dsp.img', 'exaid.img', 'cust.img'):
+        return False
+    if any(base == p + '.img' or base.startswith(p + '_') for p in skip_prefixes):
+        return False
+    ftype = gettype.gettype(img_path)
+    if ftype in ('super', 'boot', 'vendor_boot', 'vbmeta', 'dtbo', 'dtb'):
+        return False
+    return True
+
+
+def _detect_super_mode(super_info):
+    if super_info.get('is_virtual_ab') or super_info.get('metadata_slot_count', 0) >= 3:
+        return 'vab'
+    if super_info.get('metadata_slot_count') == 2:
+        return 'ab'
+    return 'a_only'
+
+
+def repack_super(use_saved_layout=None):
+    super_info_path = os.path.join(V.config, 'super_info.json')
+    super_info = None
+    if os.path.isfile(super_info_path):
+        try:
+            with open(super_info_path, 'r', encoding='utf-8') as sf:
+                loaded_info = json.load(sf)
+            if loaded_info and loaded_info.get('block_devices'):
+                detected_mode = _detect_super_mode(loaded_info)
+                mode_label = {'vab': 'Virtual A/B', 'ab': 'Dynamic A/B', 'a_only': 'Dynamic A-only'}[detected_mode]
+                blk = loaded_info['block_devices'][0]
+                grp_names = [g['name'] for g in loaded_info.get('group_table', []) if g['name'] != 'default']
+                display(
+                    f"Detected super_info.json: {mode_label} | Size:{blk['size']} | Slots:{loaded_info['metadata_slot_count']} | Groups:{','.join(grp_names) or 'default'}")
+                if use_saved_layout is None:
+                    ans = input('> Use original super.img layout? [1=Yes / 0=Use setup.json] (default 1): ').strip()
+                    use_saved_layout = (ans != '0')
+                if use_saved_layout:
+                    super_info = loaded_info
+        except Exception as e:
+            print(f"Warning: failed to load super_info.json: {e}")
+
+    img_files = sorted(f for f in glob(os.path.join(V.out, '*.img')) if _is_super_member_img(f))
+    if not img_files:
         input('> No usable image files found in the out folder')
         return
+
+    if super_info:
+        mode = _detect_super_mode(super_info)
+        blk = super_info['block_devices'][0]
+        super_name = blk.get('name') or 'super'
+        super_size = str(blk['size'])
+        alignment = int(blk.get('alignment') or 1048576)
+        alignment_offset = int(blk.get('alignment_offset') or 0)
+        metadata_size = str(super_info.get('metadata_max_size') or 65536)
+        block_size = str(blk.get('block_size') or 4096)
+        metadata_slots = int(super_info.get('metadata_slot_count') or {'a_only': 1, 'ab': 2, 'vab': 3}[mode])
+        saved_groups = {g['name']: g for g in super_info.get('group_table', [])}
+        saved_parts = {p['name']: p for p in super_info.get('partition_table', [])}
+    else:
+        mode = {'0': 'a_only', '1': 'vab', '2': 'ab'}.get(V.SETUP_MANIFEST['IS_VAB'], 'vab')
+        super_name = 'super'
+        super_size = str(V.SETUP_MANIFEST['SUPER_SIZE'])
+        alignment = int(V.SETUP_MANIFEST['SUPER_SECTOR']) * 512
+        alignment_offset = 0
+        metadata_size = '65536'
+        block_size = '4096'
+        metadata_slots = {'a_only': 1, 'ab': 2, 'vab': 3}[mode]
+        saved_groups = {}
+        saved_parts = {}
+
+    device_spec = f'{super_name}:{super_size}:{alignment}'
+    if alignment_offset:
+        device_spec += f':{alignment_offset}'
+
+    cmd = [
+        'lpmake',
+        '--metadata-size', metadata_size,
+        '--super-name', super_name,
+        '--block-size', block_size,
+        '--device', device_spec,
+        '--metadata-slots', str(metadata_slots),
+    ]
+    if mode == 'vab':
+        cmd.extend(['--virtual-ab', '-F'])
+
+    used_files = []
+    included_parts = []
+    groups_to_add = {}
+
+    def resolve_group(part_name, default_group):
+        if part_name in saved_parts:
+            gname = saved_parts[part_name].get('group_name') or default_group
+        else:
+            gname = default_group
+        if gname and gname != 'default' and gname not in groups_to_add:
+            max_sz = saved_groups.get(gname, {}).get('maximum_size', int(super_size))
+            groups_to_add[gname] = str(max_sz)
+        return gname
+
+    def resolve_attr(part_name):
+        if part_name in saved_parts:
+            return 'readonly' if saved_parts[part_name].get('readonly', True) else 'none'
+        return 'readonly'
+
+    if mode == 'a_only':
+        default_group = next((g for g in saved_groups if g != 'default'), V.SETUP_MANIFEST['GROUP_NAME'])
+        for img_path in img_files:
+            _ensure_raw_img(img_path)
+            part_name = os.path.basename(img_path).rsplit('.', 1)[0]
+            part_size = imgextractor.ULTRAMAN().LEMON(img_path)
+            grp = resolve_group(part_name, default_group)
+            attr = resolve_attr(part_name)
+            cmd.extend(['--partition', f'{part_name}:{attr}:{part_size}:{grp}'])
+            if part_size > 0:
+                cmd.extend(['--image', f'{part_name}={img_path}'])
+            used_files.append(img_path)
+            included_parts.append(part_name)
+    else:
+        # Dynamic A/B (mode == 'ab') and Virtual A/B (mode == 'vab')
+        slot_map = {}
+        for img_path in img_files:
+            stem = os.path.basename(img_path).rsplit('.', 1)[0]
+            if stem.endswith('_a'):
+                base = stem[:-2]
+                slot_map.setdefault(base, {})['a'] = img_path
+            elif stem.endswith('_b'):
+                base = stem[:-2]
+                slot_map.setdefault(base, {})['b'] = img_path
+            else:
+                slot_map.setdefault(stem, {})['plain'] = img_path
+
+        default_grp_a = next((g for g in saved_groups if g.endswith('_a')), f'{V.SETUP_MANIFEST["GROUP_NAME"]}_a')
+        default_grp_b = next((g for g in saved_groups if g.endswith('_b')), f'{V.SETUP_MANIFEST["GROUP_NAME"]}_b')
+        for gname, gdata in saved_groups.items():
+            if gname != 'default':
+                groups_to_add[gname] = str(gdata.get('maximum_size', int(super_size)))
+
+        for base, files in sorted(slot_map.items()):
+            img_a = files.get('a') or files.get('plain')
+            img_b = files.get('b')
+            part_a = f'{base}_a'
+            part_b = f'{base}_b'
+            grp_a = resolve_group(part_a, default_grp_a)
+            grp_b = resolve_group(part_b, default_grp_b)
+            attr_a = resolve_attr(part_a)
+            attr_b = resolve_attr(part_b)
+
+            if img_a:
+                _ensure_raw_img(img_a)
+                size_a = imgextractor.ULTRAMAN().LEMON(img_a)
+                cmd.extend(['--partition', f'{part_a}:{attr_a}:{size_a}:{grp_a}'])
+                if size_a > 0:
+                    cmd.extend(['--image', f'{part_a}={img_a}'])
+                used_files.append(img_a)
+                included_parts.append(part_a)
+            else:
+                cmd.extend(['--partition', f'{part_a}:{attr_a}:0:{grp_a}'])
+
+            if img_b:
+                _ensure_raw_img(img_b)
+                size_b = imgextractor.ULTRAMAN().LEMON(img_b)
+                cmd.extend(['--partition', f'{part_b}:{attr_b}:{size_b}:{grp_b}'])
+                if size_b > 0:
+                    cmd.extend(['--image', f'{part_b}={img_b}'])
+                used_files.append(img_b)
+                included_parts.append(part_b)
+            else:
+                cmd.extend(['--partition', f'{part_b}:{attr_b}:0:{grp_b}'])
+
+    if '--image' not in cmd:
+        input('> No usable image files found in the out folder')
+        return
+
+    for gname, gsize in groups_to_add.items():
+        cmd.extend(['--group', f'{gname}:{gsize}'])
+
     if V.SETUP_MANIFEST['SUPER_SPARSE'] == '1':
-        argvs += '--sparse '
-    argvs += f'--group {V.SETUP_MANIFEST["GROUP_NAME"]}_a:{V.SETUP_MANIFEST["SUPER_SIZE"]} --group {V.SETUP_MANIFEST["GROUP_NAME"]}_b:{V.SETUP_MANIFEST["SUPER_SIZE"]} --output {V.out + "super.img"} '
+        cmd.append('--sparse')
+
+    out_super = os.path.join(V.out, 'super.img')
+    cmd.extend(['--output', out_super])
+    mode_label = {'vab': 'Virtual A/B', 'ab': 'Dynamic A/B', 'a_only': 'Dynamic A-only'}[mode]
     display(
-        f'Repacking: super.img <Size:{V.SETUP_MANIFEST["SUPER_SIZE"]}|Vab:{V.SETUP_MANIFEST["IS_VAB"]}|Sparse:{V.SETUP_MANIFEST["SUPER_SPARSE"]}>')
-    display(f"Included partitions: {'|'.join(parts)}")
+        f'Repacking: super.img <Mode:{mode_label}|Size:{super_size}|Slots:{metadata_slots}|Sparse:{V.SETUP_MANIFEST["SUPER_SPARSE"]}>')
+    display(f"Included partitions: {'|'.join(included_parts)}")
     with CoastTime():
-        call(argvs)
-    try:
-        if os.path.isfile(os.path.join(V.out, 'super.img')):
-            for i in parts:
-                for slot in ('_a', '_b', ''):
-                    if os.path.isfile(os.path.join(V.out, i + slot + '.img')):
-                        os.remove(os.path.join(V.out, i + slot + '.img'))
-    except (BaseException, Exception):
-        ...
+        rc = call(cmd)
+    if rc == 0 and os.path.isfile(out_super):
+        for fpath in used_files:
+            try:
+                if os.path.isfile(fpath):
+                    os.remove(fpath)
+            except Exception:
+                ...
+    else:
+        print(f" {RED}Repack super.img failed (exit code {rc}){CLOSE}")
 
 
 def walk_contexts(contexts):
@@ -710,23 +853,30 @@ def recompress(source, fsconfig, contexts, dumpinfo, flag=8):
             if not os.path.isfile(new_op_list):
                 shutil.copyfile(op_list, new_op_list)
         else:
+            grp_name = V.SETUP_MANIFEST["GROUP_NAME"]
             CONTENT = "remove_all_groups\n"
-            for slot in ('_a', '_b'):
-                CONTENT += f"add_group qti_dynamic_partitions{slot} {V.SETUP_MANIFEST['SUPER_SIZE']}\n"
-
-            for partition in ('system', 'system_ext', 'product', 'vendor', 'odm'):
-                for slot in ('_a', '_b'):
-                    CONTENT += f"add {partition}{slot} qti_dynamic_partitions{slot}\n"
-
-            if V.SETUP_MANIFEST["IS_VAB"] == "1":
-                for partition in ('system_a', 'system_ext_a', 'product_a', 'vendor_a',
-                                  'odm_a'):
+            if V.SETUP_MANIFEST["IS_VAB"] == "0":
+                CONTENT += f"add_group {grp_name} {V.SETUP_MANIFEST['SUPER_SIZE']}\n"
+                for partition in ('system', 'system_ext', 'product', 'vendor', 'odm'):
+                    CONTENT += f"add {partition} {grp_name}\n"
+                for partition in ('system', 'system_ext', 'product', 'vendor', 'odm'):
                     CONTENT += f"resize {partition} 2\n"
-
             else:
+                for slot in ('_a', '_b'):
+                    CONTENT += f"add_group {grp_name}{slot} {V.SETUP_MANIFEST['SUPER_SIZE']}\n"
+
                 for partition in ('system', 'system_ext', 'product', 'vendor', 'odm'):
                     for slot in ('_a', '_b'):
-                        CONTENT += f"resize {partition}{slot} 2\n"
+                        CONTENT += f"add {partition}{slot} {grp_name}{slot}\n"
+
+                if V.SETUP_MANIFEST["IS_VAB"] == "1":
+                    for partition in ('system_a', 'system_ext_a', 'product_a', 'vendor_a',
+                                      'odm_a'):
+                        CONTENT += f"resize {partition} 2\n"
+                else:
+                    for partition in ('system', 'system_ext', 'product', 'vendor', 'odm'):
+                        for slot in ('_a', '_b'):
+                            CONTENT += f"resize {partition}{slot} 2\n"
 
             with open(new_op_list, "w", encoding="UTF-8", newline="\n") as ST:
                 ST.write(CONTENT)
@@ -937,26 +1087,74 @@ def decompress_img(source, distance, keep=1):
                     source = source.replace('.unsparse', '')
                 call(f'extract.erofs -i {source.replace(os.sep, "/")} -o {V.main_dir} -x')
             elif file_type == 'super':
-                lpunpack.unpack(source,V.input )
-                for img in glob(V.input + '*_*.img'):
-                    if not V.SETUP_MANIFEST['IS_VAB'] == '1' or os.path.getsize(img) == 0:
-                        os.remove(img)
-                    else:
-                        new_source = img.replace('_a.img', '.img')
-                        try:
-                            os.rename(img, new_source)
-                        except:
-                            ...
-                        new_source = img.replace('_b.img', '.img')
-                        try:
-                            os.rename(img, new_source)
-                        except:
-                            ...
-                j = input('> Continue unpacking .img files? [0/1]: ') == 1
-                if j != 1:
-                    return
-                for img in glob(V.input + '*.img'):
-                    decompress_img(img, V.main_dir + os.path.basename(img).rsplit('.', 1)[0], keep=0)
+                slot_num = 0
+                super_meta = lpunpack.get_metadata(source, slot=0)
+                if super_meta:
+                    slot_count = super_meta.get('metadata_slot_count', 1)
+                    if slot_count > 1:
+                        slot0_nonempty = any(p.get('size', 0) > 0 for p in super_meta.get('partition_table', []))
+                        if not slot0_nonempty:
+                            alt_meta = lpunpack.get_metadata(source, slot=1)
+                            if alt_meta and any(p.get('size', 0) > 0 for p in alt_meta.get('partition_table', [])):
+                                slot_num = 1
+                                super_meta = alt_meta
+                        elif not V.JM:
+                            slot_in = input(f'> Detected {slot_count} metadata slots. Select slot [0-{slot_count - 1}] (default 0): ').strip()
+                            if slot_in.isdigit() and 0 <= int(slot_in) < slot_count:
+                                slot_num = int(slot_in)
+                                super_meta = lpunpack.get_metadata(source, slot=slot_num) or super_meta
+                    super_mode = _detect_super_mode(super_meta)
+                    mode_label = {'vab': 'Virtual A/B', 'ab': 'Dynamic A/B', 'a_only': 'Dynamic A-only'}[super_mode]
+                    display(f"Super layout: {mode_label} | Metadata slot: {slot_num}/{slot_count} | Size: {super_meta['block_devices'][0]['size']}")
+                    with open(os.path.join(V.config, 'super_info.json'), 'w', encoding='utf-8') as sf:
+                        json.dump(super_meta, sf, indent=4)
+
+                lpunpack.unpack(source, V.input, slot=slot_num)
+
+                part_names = [p['name'] for p in super_meta.get('partition_table', [])] if super_meta else []
+                extracted_imgs = []
+                if part_names:
+                    for pname in part_names:
+                        img_path = os.path.join(V.input, f'{pname}.img')
+                        if os.path.isfile(img_path):
+                            if os.path.getsize(img_path) == 0:
+                                os.remove(img_path)
+                            else:
+                                extracted_imgs.append(img_path)
+                else:
+                    src_abs = os.path.abspath(source)
+                    for img_path in glob(os.path.join(V.input, '*.img')):
+                        if os.path.abspath(img_path) == src_abs or os.path.basename(img_path).lower().startswith('super'):
+                            continue
+                        if os.path.getsize(img_path) == 0:
+                            os.remove(img_path)
+                        else:
+                            extracted_imgs.append(img_path)
+
+                # Strip _a/_b suffix only when a single slot is populated (so dual-slot A/B images never collide)
+                nonempty_a = {os.path.basename(p)[:-6] for p in extracted_imgs if p.endswith('_a.img')}
+                nonempty_b = {os.path.basename(p)[:-6] for p in extracted_imgs if p.endswith('_b.img')}
+                has_dual_slots = bool(nonempty_a and nonempty_b)
+
+                final_imgs = []
+                for img_path in extracted_imgs:
+                    if not has_dual_slots and (img_path.endswith('_a.img') or img_path.endswith('_b.img')):
+                        stripped = img_path[:-6] + '.img'
+                        if not os.path.exists(stripped):
+                            try:
+                                os.rename(img_path, stripped)
+                                img_path = stripped
+                            except Exception:
+                                ...
+                    final_imgs.append(img_path)
+
+                if not V.JM:
+                    j = input('> Continue unpacking .img files? [0/1]: ').strip()
+                    if j != '1':
+                        return
+                for img in final_imgs:
+                    if os.path.isfile(img):
+                        decompress_img(img, V.main_dir + os.path.basename(img).rsplit('.', 1)[0], keep=0)
             else:
                 print(F'> ..., unsupported fs_type [{file_type}]')
             distance = V.main_dir + os.path.basename(source).replace('.unsparse.img', '').replace('.img', '')
@@ -1058,8 +1256,8 @@ def decompress_bin(infile, outdir, flag='1'):
     else:
         print(f"> {YELLOW}Extracting all image files from [{os.path.basename(infile)}]:{CLOSE}\n")
         extract_payload.main(infile, outdir)
-        j = input('> Continue unpacking .img files? [0/1]: ') == 1
-        if j != 1:
+        j = input('> Continue unpacking .img files? [0/1]: ').strip()
+        if j != '1':
             return
         for img in glob(V.input + '*.img'):
             decompress_img(img, V.main_dir + os.path.basename(img).rsplit('.', 1)[0], keep=0)

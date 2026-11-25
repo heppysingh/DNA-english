@@ -29,7 +29,10 @@
 
 10. Added MagiskBootKitchen (Android-Image-Kitchen) to unpack/repack `[boot|exaid|recovery/etc].img` ---- 2024.4.4
 
-11. Supports unpacking some `super.img` files (does not support dynamic A/B dual-slot; latest Xiaomi 11 `super.img` not supported in testing; public beta) ---- 2021.01.09
+11. Supports unpacking and repacking **Dynamic A-only, Dynamic A/B (including dual-slot), and Virtual A/B** `super.img` files:
+    - Automatically saves the original `super.img` metadata layout (`super_info.json`: size, alignment, slot count, groups, and partition attributes) during unpacking and reuses it when repacking.
+    - Supports multi-slot metadata selection, `ZERO` extents, and sparse/raw `super.img` images.
+    - Manual slot mode can also be configured in Settings (`[77]` → `IS_VAB`: `0=A-only`, `1=Virtual A/B`, `2=Dynamic A/B`).
 
 12. Fixed inaccurate size detection for some dynamic partitions! ---- 2021.01.09
 
